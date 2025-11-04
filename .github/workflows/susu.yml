@@ -1,0 +1,89 @@
+name: Build Aetherium1.0-SuSu (Android 14 - Kernel 6.1 + SukiSU)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    name: Build Aetherium1.0-SuSu Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y git curl python3 python3-pip openjdk-11-jdk zip unzip bc bison flex \
+            build-essential ccache libncurses-dev libssl-dev lld repo rsync jq nano
+          python3 -m pip install --upgrade pip
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Initialize Android 14 Kernel Source (6.1)
+        run: |
+          mkdir kernel_build && cd kernel_build
+          echo "==> Initializing Android14-6.1 manifest..."
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1-2025-09
+          repo sync -c --no-tags --no-clone-bundle --optimized-fetch --force-sync
+          ls
+
+      - name: Run SukiSU Quick Setup (Auto Patch)
+        run: |
+          cd kernel_build/common
+          echo "==> Running SukiSU quick setup (auto patch KPM + SUSFS + Zakosu)..."
+          curl -LSs "https://raw.githubusercontent.com/Lama3L9R/sukisu-quick-setup/master/zako-zako-zako.sh" | bash -s
+          echo "==> SukiSU patch complete."
+
+      - name: Set Kernel Version & Clean setlocalversion
+        run: |
+          cd kernel_build/common
+          echo "" > scripts/setlocalversion
+          chmod +x scripts/setlocalversion
+          export LOCALVERSION="-Aetherium1.0-SuSu"
+          echo "==> Kernel localversion set to Aetherium1.0-SuSu"
+
+      - name: Prepare Bazel Environment
+        run: |
+          cd kernel_build/common
+          export CCACHE_DIR=$HOME/.ccache
+          export CCACHE_COMPRESS=1
+          export CCACHE_MAXSIZE=10G
+          ccache -z
+          echo "==> Bazel environment ready."
+
+      - name: Build Kernel (Bazel)
+        run: |
+          cd kernel_build/common
+          echo "==> Starting Bazel build for Aetherium1.0-SuSu..."
+          bazel clean
+          bazel build //common:kernel_aarch64
+          echo "==> Bazel build complete."
+          ls -R bazel-bin | grep Image || true
+
+      - name: Upload Image to Pixeldrain
+        env:
+          PIXELDRAIN_TOKEN: 23c84c82-ce06-4e35-bc1f-69eaa13b9958
+        run: |
+          cd kernel_build/common
+          IMAGE_PATH=$(find bazel-bin -type f -name "Image" | head -n 1)
+          if [ -f "$IMAGE_PATH" ]; then
+            echo "==> Uploading $IMAGE_PATH to Pixeldrain..."
+            RESPONSE=$(curl -s -u :${PIXELDRAIN_TOKEN} -F file=@"$IMAGE_PATH" https://pixeldrain.com/api/file)
+            echo "$RESPONSE" | jq .
+            URL=$(echo "$RESPONSE" | jq -r '.url')
+            echo "Pixeldrain URL: $URL"
+            echo "Aetherium1.0-SuSu Image: $URL" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ERROR: Image file not found!"
+            exit 1
+          fi
+
+      - name: Show ccache stats
+        run: ccache -s
