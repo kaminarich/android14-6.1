@@ -1,0 +1,91 @@
+name: Build Aetherium-1.0 (Android 14 - Kernel 6.1 + KernelSU Next)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    name: Build Aetherium-1.0 Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y git curl python3 python3-pip openjdk-11-jdk zip unzip bc bison flex \
+            build-essential ccache libncurses-dev libssl-dev lld repo rsync jq
+          python3 -m pip install --upgrade pip
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Initialize Android 14 Kernel Source (6.1)
+        run: |
+          mkdir kernel_build && cd kernel_build
+          echo "==> Initializing Android14-6.1 manifest..."
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1-2025-09
+          repo sync -c --no-tags --no-clone-bundle --optimized-fetch --force-sync
+          ls
+
+      - name: Inject KernelSU Next
+        run: |
+          cd kernel_build/common
+          echo "==> Cloning KernelSU Next..."
+          git clone https://github.com/tiann/KernelSU.git -b next KernelSU
+          echo "==> Integrating KernelSU..."
+          cp -r KernelSU/kernel su
+          echo "obj-y += su/" >> common/Makefile || true
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/gki_defconfig
+          echo "==> KernelSU Next integrated."
+
+      - name: Set Aetherium-1.0 Version & Fix setlocalversion
+        run: |
+          cd kernel_build/common
+          echo "" > scripts/setlocalversion
+          chmod +x scripts/setlocalversion
+          echo "export LOCALVERSION=-Aetherium-1.0" >> .bazelrc
+          echo "==> Local version fixed to Aetherium-1.0."
+
+      - name: Prepare Bazel Build Environment
+        run: |
+          cd kernel_build/common
+          export CCACHE_DIR=$HOME/.ccache
+          export CCACHE_COMPRESS=1
+          export CCACHE_MAXSIZE=10G
+          ccache -z
+
+      - name: Build Kernel (Bazel)
+        run: |
+          cd kernel_build/common
+          echo "==> Starting Bazel build for Aetherium-1.0..."
+          bazel clean
+          bazel build //common:kernel_aarch64
+          echo "==> Build completed."
+          ls -R bazel-bin | grep Image || true
+
+      - name: Upload Image to Pixeldrain
+        env:
+          PIXELDRAIN_TOKEN: 23c84c82-ce06-4e35-bc1f-69eaa13b9958
+        run: |
+          cd kernel_build/common
+          IMAGE_PATH=$(find bazel-bin -type f -name "Image" | head -n 1)
+          if [ -f "$IMAGE_PATH" ]; then
+            echo "==> Uploading $IMAGE_PATH to Pixeldrain..."
+            RESPONSE=$(curl -s -u :${PIXELDRAIN_TOKEN} -F file=@"$IMAGE_PATH" https://pixeldrain.com/api/file)
+            echo "$RESPONSE" | jq .
+            echo "Pixeldrain URL:"
+            echo "$RESPONSE" | jq -r '.url'
+          else
+            echo "ERROR: Image file not found!"
+            exit 1
+          fi
+
+      - name: Show ccache stats
+        run: ccache -s
