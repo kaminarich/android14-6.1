@@ -1,0 +1,115 @@
+name: Build Aetherium1.0-SuSu (Android 14 - Kernel 6.1 + SukiSU)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    name: Build Aetherium1.0-SuSu Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies (Optimized)
+        run: |
+          sudo apt update -qq
+          sudo apt install -y git curl python3 openjdk-17-jre-headless zip unzip bc bison flex \
+            build-essential ccache libncurses-dev libssl-dev lld repo rsync jq
+          # install repo helper quickly
+          sudo curl -Lo /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          sudo chmod +x /usr/local/bin/repo
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Initialize Android 14 Kernel Source (6.1)
+        run: |
+          mkdir kernel_build && cd kernel_build
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1-2025-09
+          repo sync -c --no-tags --no-clone-bundle --optimized-fetch --force-sync
+
+      - name: Run SukiSU Quick Setup (non-interactive)
+        env:
+          # force the quick-setup script to skip interactive editor
+          EDITOR: true
+          VISUAL: true
+        run: |
+          set -euo pipefail
+          cd kernel_build/common
+          echo "==> Running SukiSU quick setup (non-interactive)..."
+          # run the script but do not fail workflow on nonfatal patch rejects (|| true)
+          curl -LSs "https://raw.githubusercontent.com/Lama3L9R/sukisu-quick-setup/master/zako-zako-zako.sh" | bash -s || true
+          echo "==> SukiSU script finished (warnings may be present)."
+
+      - name: Regenerate defconfig to match patched tree
+        run: |
+          set -euo pipefail
+          cd kernel_build/common
+          # Choose an OUT dir for defconfig generation that won't conflict with Bazel sandbox
+          OUT_DIR=out_savedef
+          mkdir -p "${OUT_DIR}"
+          echo "==> Generating defconfig in ${OUT_DIR}..."
+          # Run defconfig and savedefconfig so output reflects applied patches
+          # Use gki_defconfig as DEFCONFIG if present
+          if [ -f arch/arm64/configs/gki_defconfig ]; then
+            # The kernel Makefile expects the defconfig name without path
+            make O="${OUT_DIR}" gki_defconfig || make O="${OUT_DIR}" defconfig
+          else
+            make O="${OUT_DIR}" defconfig
+          fi
+          make -C . O="${OUT_DIR}" savedefconfig
+          # savedefconfig writes 'defconfig' in OUT_DIR
+          if [ -f "${OUT_DIR}/defconfig" ]; then
+            echo "==> Replacing arch/arm64/configs/gki_defconfig with generated defconfig..."
+            cp "${OUT_DIR}/defconfig" arch/arm64/configs/gki_defconfig
+          else
+            echo "WARNING: ${OUT_DIR}/defconfig not found — continuing (may still fail)"
+          fi
+          # Ensure setlocalversion empty to avoid long names
+          echo "" > scripts/setlocalversion
+          chmod +x scripts/setlocalversion
+
+      - name: Prepare Bazel Cache
+        run: |
+          cd kernel_build/common
+          export CCACHE_DIR=$HOME/.ccache
+          export CCACHE_COMPRESS=1
+          export CCACHE_MAXSIZE=10G
+          ccache -z
+
+      - name: Build Kernel with Bazel
+        run: |
+          cd kernel_build/common
+          echo "==> Starting Bazel build for Aetherium1.0-SuSu..."
+          bazel clean --expunge
+          # If you want to skip the defconfig strict check instead, add --nocheck_defconfig
+          bazel build //common:kernel_aarch64 --verbose_failures
+          echo "==> Build finished."
+          find bazel-bin -type f -name "Image" -print || true
+
+      - name: Upload Built Image to Pixeldrain (and write to summary)
+        env:
+          PIXELDRAIN_TOKEN: 23c84c82-ce06-4e35-bc1f-69eaa13b9958
+        run: |
+          cd kernel_build/common
+          IMAGE_PATH=$(find bazel-bin -type f -name "Image" | head -n 1 || true)
+          if [ -z "$IMAGE_PATH" ] || [ ! -f "$IMAGE_PATH" ]; then
+            echo "ERROR: Image not found at bazel-bin."
+            exit 1
+          fi
+          echo "==> Uploading $IMAGE_PATH to Pixeldrain..."
+          RESPONSE=$(curl -s -u :${PIXELDRAIN_TOKEN} -F file=@"$IMAGE_PATH" https://pixeldrain.com/api/file)
+          echo "$RESPONSE" | jq .
+          URL=$(echo "$RESPONSE" | jq -r '.url')
+          echo "Pixeldrain URL: $URL"
+          # write into GitHub Actions summary so link is visible in UI
+          echo "Aetherium1.0-SuSu Image: $URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: Show ccache stats
+        run: ccache -s
